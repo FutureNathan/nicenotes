@@ -32,49 +32,19 @@ interface CameraTween {
   duration: number;
 }
 
-const LIFT = 0.11;
+const LIFT = 0.08;
 const TAP_MS = 320;
 const TAP_PX = 9;
 const OPEN_ENOUGH = 0.7;
 
 const easeInOut = (u: number) => (u < 0.5 ? 4 * u * u * u : 1 - Math.pow(-2 * u + 2, 3) / 2);
 
-/** Pick a grid size the device can simulate comfortably (cached per device). */
-function chooseGrid(): [number, number] {
-  const key = 'nicenotes:grid:v2';
-  try {
-    const cached = localStorage.getItem(key);
-    if (cached) {
-      const [a, b] = cached.split('x').map(Number);
-      if (a > 0 && b > 0 && a % 2 === 0 && b % 2 === 0) return [a, b];
-    }
-  } catch {
-    // Storage can be unavailable (private mode); just measure.
-  }
-  const sim = new PaperSim(24, 30);
-  const pose = new Float32Array(sim.n * 3);
-  foldPose(sim, Math.PI, Math.PI, pose);
-  sim.adoptPose(pose, true);
-  const opener = new FlapOpener(sim, 1, 0.4);
-  for (let i = 0; i < 5; i++) {
-    opener.update(1 / 60);
-    sim.step(1 / 60);
-  }
-  const t0 = performance.now();
-  for (let i = 0; i < 10; i++) {
-    opener.update(1 / 60);
-    sim.step(1 / 60);
-  }
-  const ms = (performance.now() - t0) / 10;
-  // Fold lines must fall on grid lines, so both counts stay even.
-  const grid: [number, number] = ms < 6 ? [24, 30] : [16, 20];
-  try {
-    localStorage.setItem(key, grid.join('x'));
-  } catch {
-    // Fine: we'll measure again next time.
-  }
-  return grid;
-}
+/**
+ * Grid size. 16x20 looks smooth once lit and shaded, unfolds cleanly, settles
+ * quickly and stays cheap on every phone (finer grids converge more slowly and
+ * cost 2-3x as much per frame).
+ */
+const GRID: [number, number] = [16, 20];
 
 export class Scene {
   readonly canvas: HTMLCanvasElement;
@@ -86,6 +56,10 @@ export class Scene {
   onPhase: ((phase: Phase) => void) | null = null;
   /** Called the first time someone touches the paper. */
   onTouch: (() => void) | null = null;
+  /** Where "tidy" puts the paper: always folded (sender), or as far as it got (receiver). */
+  tidyTo: 'folded' | 'progress' = 'progress';
+  /** Called when the paper gets moved around (so the UI can offer to tidy it). */
+  onDisturb: (() => void) | null = null;
   reducedMotion = false;
 
   private renderer: Renderer;
@@ -104,6 +78,7 @@ export class Scene {
   private tween: CameraTween | null = null;
   private framing: 'home' | 'note' | 'custom' = 'home';
   private fold: { t: number; done: () => void } | null = null;
+  private tidying: { from: Float32Array; to: Float32Array; t: number; mark: boolean } | null = null;
   private raf = 0;
   private lastTime = 0;
   private needsDraw = true;
@@ -119,7 +94,7 @@ export class Scene {
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.renderer = new Renderer(canvas);
-    const [nx, nz] = chooseGrid();
+    const [nx, nz] = GRID;
     this.sim = new PaperSim(nx, nz);
     this.renderNormals = new Float32Array(this.sim.n * 3);
     this.scratch = new Float32Array(this.sim.n * 3);
@@ -375,13 +350,13 @@ export class Scene {
 
   private pointerDown(e: PointerEvent): void {
     if (this.phase !== 'folded' && this.phase !== 'open') return;
-    if (this.opener || this.openQueue.length || this.fingers.size >= 2) return;
+    if (this.opener || this.openQueue.length || this.tidying || this.fingers.size >= 2) return;
     const [x, y] = this.localPoint(e);
     const particle = this.pick(x, y);
     if (particle === null) return;
     e.preventDefault();
     this.canvas.setPointerCapture(e.pointerId);
-    const grab = this.sim.grab(particle);
+    const grab = this.sim.grab(particle, true);
     this.fingers.set(e.pointerId, {
       grab,
       x,
@@ -406,7 +381,10 @@ export class Scene {
     const now = performance.now();
     f.trail.push([now, x, y]);
     while (f.trail.length > 2 && now - f.trail[0][0] > 120) f.trail.shift();
-    if (Math.hypot(x - f.startX, y - f.startY) > TAP_PX) f.moved = true;
+    if (!f.moved && Math.hypot(x - f.startX, y - f.startY) > TAP_PX) {
+      f.moved = true;
+      this.onDisturb?.();
+    }
     this.invalidate();
   }
 
@@ -485,6 +463,23 @@ export class Scene {
     const dt = Math.min(Math.max(rawDt, 0), 1 / 24);
     let busy = false;
 
+    // Floating back to a neat pose (kinematic).
+    if (this.tidying) {
+      busy = true;
+      const a = this.tidying;
+      a.t += dt;
+      const u = Math.min(1, a.t / (this.reducedMotion ? 0.35 : 0.75));
+      const e = easeInOut(u);
+      const lift = 0.12 * Math.sin(Math.PI * e);
+      const p = this.sim.pos;
+      for (let k = 0; k < p.length; k++) p[k] = a.from[k] + (a.to[k] - a.from[k]) * e;
+      for (let k = 1; k < p.length; k += 3) p[k] += lift;
+      if (u >= 1) {
+        this.sim.adoptPose(a.to, a.mark);
+        this.tidying = null;
+      }
+    }
+
     // Sender's folding animation (kinematic).
     if (this.fold) {
       busy = true;
@@ -555,8 +550,12 @@ export class Scene {
       }
     }
 
-    if (this.phase === 'open' || this.phase === 'folded') busy = this.keepInView(dt) || busy;
-    const simmed = !this.fold && this.sim.step(dt);
+    if ((this.phase === 'open' || this.phase === 'folded') && !this.tidying) busy = this.keepInView(dt) || busy;
+    const simmed = !this.fold && !this.tidying && this.sim.step(dt);
+    // Safety net: if the numbers ever go bad, put the paper back neatly.
+    if (simmed && !Number.isFinite(this.sim.pos[0] + this.sim.pos[this.sim.pos.length - 2])) {
+      this.tidy(true);
+    }
     busy ||= simmed;
 
     // Notice when the note has been opened up.
@@ -621,6 +620,43 @@ export class Scene {
       this.activeTime = 0;
       this.slowTime = 0;
     }
+  }
+
+  /**
+   * Float the paper back to its neat pose: folded if it hasn't been opened
+   * yet, otherwise lying flat in the middle of the table.
+   */
+  tidy(immediate = false): void {
+    if (this.phase !== 'folded' && this.phase !== 'open') return;
+    for (const f of this.fingers.values()) this.sim.release(f.grab, 0);
+    this.fingers.clear();
+    this.opener?.cancel();
+    this.opener = null;
+    this.openQueue = [];
+    const to = new Float32Array(this.sim.n * 3);
+    const folded = this.phase === 'folded' || this.tidyTo === 'folded';
+    if (folded) this.setPhase('folded');
+    if (folded) {
+      foldPose(this.sim, Math.PI, Math.PI, to);
+    } else {
+      for (let i = 0; i < this.sim.n; i++) {
+        to[i * 3] = this.sim.restX[i];
+        to[i * 3 + 2] = this.sim.restZ[i];
+      }
+    }
+    if (immediate) {
+      this.tidying = null;
+      this.sim.adoptPose(to, folded);
+    } else {
+      this.tidying = { from: this.sim.pos.slice(), to, t: 0, mark: folded };
+    }
+    if (folded) {
+      this.touched = false;
+      this.moveCamera('note', 0.8);
+    } else {
+      this.moveCamera('home', 0.8);
+    }
+    this.invalidate();
   }
 
   /** Stop drawing (e.g. while the page shows something else). */

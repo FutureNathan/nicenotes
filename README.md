@@ -52,14 +52,20 @@ src/
   note/codec.ts       link format and encryption
 ```
 
-**Physics.** The sheet is a grid of particles (24×30 normally, 16×20 on slower phones; it measures once and
-remembers). Each frame runs about 8 XPBD substeps:
-- Distance constraints keep the sheet from stretching.
-- Curvature constraints make it stiff like paper.
-- Creases are *plastic*: they remember the fold, give way when you open it, and leave a soft tent.
-- Air drag acts along the surface normal, so the paper floats as it falls.
-- Folded layers rest on each other through "layer contacts". Each nearby pair remembers which side of the sheet the
-  other is on, so layers can be paper-thin without passing through each other.
+**Physics.** The sheet is a 16×20 grid of particles, solved with small-step XPBD (about 8 substeps per
+frame):
+- **No stretching:** distance constraints, plus *tethers* while a finger holds the paper. No point can end up
+  farther from the finger than it is across the flat sheet, so the whole sheet follows at once.
+- **Paper, not cloth:** curvature constraints keep it stiff, so it bends in big smooth curls.
+- **Creases:** where the note was folded, the sheet becomes a weak hinge. It bends easily there, and the folded
+  note stays folded under its own weight.
+- **Layers:** folded layers rest on each other through "layer contacts". Where two bits of sheet overlap and both
+  lie roughly flat, the pair remembers which is on top. Steep or crumpled bits don't take part, and a pair that's
+  clearly stuck the other way round accepts it rather than fighting. Fighting constraints are what make
+  simulations tremble.
+- **Settling:** paper is a "dead" material. Internal damping kills wobbles, and once nobody is touching it the air
+  thickens until it comes to rest and the simulation sleeps.
+- **Tidy up:** a button floats the paper back to its neat pose (folded, or flat once opened).
 
 **Smooth on phones.**
 - The simulation advances by the real frame time, so 60/90/120 Hz screens all feel the same.

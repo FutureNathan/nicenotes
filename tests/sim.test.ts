@@ -103,6 +103,63 @@ describe.each([
   });
 });
 
+describe('rough handling (the app uses 16x20)', () => {
+  function maxSpeed(sim: PaperSim): number {
+    let m = 0;
+    for (let i = 0; i < sim.n; i++) m = Math.max(m, Math.hypot(sim.vel[i * 3], sim.vel[i * 3 + 1], sim.vel[i * 3 + 2]));
+    return m;
+  }
+
+  function scribble(startFolded: boolean, path: (t: number) => [number, number], seconds: number): PaperSim {
+    const sim = new PaperSim(16, 20);
+    if (startFolded) folded(sim);
+    run(sim, 0.5);
+    const g = sim.grab(sim.idx(16, 20), true);
+    const o = g.particle * 3;
+    const [sx, sy, sz] = [sim.pos[o], sim.pos[o + 1], sim.pos[o + 2]];
+    let worst = 0;
+    for (let t = 0; t < seconds; t += FRAME) {
+      const [dx, dz] = path(t);
+      sim.moveGrab(g, sx + dx, sy + 0.08 * Math.min(1, t / 0.16), sz + dz);
+      sim.step(FRAME);
+      worst = Math.max(worst, maxStretch(sim));
+    }
+    sim.release(g, 2.2, [0, 0, 0]);
+    expect(worst).toBeLessThan(0.6);
+    return sim;
+  }
+
+  const loops = (t: number): [number, number] => [0.35 * Math.sin(t * 9), 0.35 * (Math.cos(t * 7) - 1)];
+  const overItself = (t: number): [number, number] => [-0.9 * Math.min(1, t / 0.8), -1.0 * Math.min(1, t / 0.8)];
+
+  it.each([
+    ['a folded note whipped around', true, loops, 2],
+    ['a folded note dragged over itself', true, overItself, 1],
+    ['an open sheet whipped around', false, loops, 2],
+  ] as const)('%s calms down after letting go', (_, startFolded, path, seconds) => {
+    const sim = scribble(startFolded, path, seconds);
+    run(sim, 2.5);
+    expect(finite(sim)).toBe(true);
+    expect(maxSpeed(sim)).toBeLessThan(0.05);
+    run(sim, 2);
+    expect(sim.awake).toBe(false);
+  });
+
+  it('follows a fast drag without stretching like rubber', () => {
+    const sim = new PaperSim(16, 20);
+    const g = sim.grab(sim.idx(8, 10), true);
+    let sum = 0;
+    let frames = 0;
+    for (let t = 0; t < 0.5; t += FRAME) {
+      sim.moveGrab(g, 1.5 * t, 0.08, -1.0 * t);
+      sim.step(FRAME);
+      sum += maxStretch(sim);
+      frames++;
+    }
+    expect(sum / frames).toBeLessThan(0.05);
+  });
+});
+
 it('refuses grids without a middle line to fold on', () => {
   expect(() => new PaperSim(20, 25)).toThrow();
 });

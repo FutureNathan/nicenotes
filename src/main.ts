@@ -114,6 +114,10 @@ function flatNote(note: Note): HTMLCanvasElement {
   return c;
 }
 
+function showTidy(show: boolean): void {
+  $('tidyBtn').hidden = !show;
+}
+
 function setStage(title: string, hint: string, fine = ''): void {
   $('stageTitle').textContent = title;
   $('stageHint').textContent = hint;
@@ -324,6 +328,9 @@ async function foldAndSend(): Promise<void> {
   s.setTextures(front, back);
   s.onPhase = null;
   s.onTouch = null;
+  s.tidyTo = 'folded';
+  s.onDisturb = () => showTidy(true);
+  showTidy(false);
   const rect = $('card').getBoundingClientRect();
   document.body.classList.add('folding');
   setStage('', '');
@@ -440,6 +447,9 @@ async function receive(note: Note): Promise<void> {
   stageInsets(s);
   s.resume();
   s.onTouch = () => setStage('', '', '');
+  s.tidyTo = 'progress';
+  s.onDisturb = () => showTidy(true);
+  showTidy(false);
   s.onPhase = (phase) => {
     if (phase !== 'open') return;
     $('sr').textContent = `${note.message}${note.from ? `, from ${note.from}` : ''}`;
@@ -510,6 +520,10 @@ function init(): void {
   });
   about.addEventListener('click', (e) => {
     if (e.target === about) about.close();
+  });
+  $('tidyBtn').addEventListener('click', () => {
+    scene?.tidy();
+    showTidy(false);
   });
   window.addEventListener('hashchange', route);
   window.addEventListener('popstate', route);

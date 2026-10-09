@@ -3,13 +3,19 @@
  *
  * - Distance constraints (structural + shear) keep the sheet from stretching.
  * - "Triplet" bending constraints (Kelager-style curvature) make it stiff like
- *   paper rather than floppy like cloth. Triplets that were bent when the note
- *   was folded become plastic creases: they remember the fold, and yield
- *   (mostly) when you open it, leaving a soft tent like a real unfolded note.
- * - Layer contacts let folded layers rest on each other. Each nearby pair
- *   remembers which side of the sheet (along the surface normal) one particle
- *   is on relative to the other, and keeps it that way. That lets layers be
- *   paper-thin without passing through each other, even as a folded flap swings.
+ *   paper rather than floppy like cloth. Where the note was folded, the sheet
+ *   becomes a weak hinge: it bends easily there, and a folded note stays
+ *   folded under its own weight.
+ * - Paper is a "dead" material: internal damping kills wobbles, and once
+ *   nobody is touching it the air thickens until it settles and sleeps.
+ * - Layer contacts let folded layers rest on each other. Where two bits of
+ *   sheet overlap and both lie roughly flat, the pair remembers which one is on
+ *   top and keeps it that way, so layers can be paper-thin without passing
+ *   through each other. Steep or crumpled bits don't take part: there "on top"
+ *   means nothing, and guessing would make the sheet fight itself.
+ * - While a finger holds the sheet, tethers stop any point from getting
+ *   further from the finger than it is across the flat paper, so the whole
+ *   sheet follows at once instead of stretching like rubber.
  * - Air drag acts mostly along the surface normal, so the sheet floats.
  *
  * World axes: x right, y up (out of the table), z towards the bottom of the
@@ -27,6 +33,8 @@ export interface Grab {
   ty: number;
   tz: number;
   savedInvMass: number;
+  /** Flat-paper distance from the held point to every particle, or null for no tethers. */
+  reach: Float32Array | null;
 }
 
 export interface SimTuning {
@@ -44,21 +52,27 @@ export interface SimTuning {
   /** Fraction of relative motion removed per substep between touching layers. */
   layerFriction: number;
   maxSpeed: number;
-  /** How far (as a fraction of h) a crease can be pushed before it yields. */
-  creaseYield: number;
+  /** Fraction of neighbours' relative velocity removed per substep (paper is "dead"). */
+  internalDamping: number;
+  /** Seconds after the last touch before the air gets gradually thicker. */
+  settleAfter: number;
+  /** Passes over the no-stretch constraints per substep. */
+  stretchPasses: number;
 }
 
 export const DEFAULT_TUNING: SimTuning = {
   gravity: 14,
   bendCompliance: 2.0e-6,
-  creaseCompliance: 6.0e-5,
+  creaseCompliance: 3.0e-4,
   shearCompliance: 0,
   airNormal: 5.5,
   airAll: 0.6,
-  groundFriction: 0.22,
+  groundFriction: 0.08,
   layerFriction: 0.12,
   maxSpeed: 7,
-  creaseYield: 0.22,
+  internalDamping: 0.02,
+  settleAfter: 1,
+  stretchPasses: 2,
 };
 
 const SUB_DT = 1 / 480;
@@ -90,6 +104,8 @@ export class PaperSim {
   awake = true;
 
   private calm = 0;
+  /** Seconds since anything held or poked the sheet. */
+  private untouched = 0;
 
   private readonly dA: Int32Array;
   private readonly dB: Int32Array;
@@ -99,7 +115,7 @@ export class PaperSim {
   private readonly bA: Int32Array;
   private readonly bM: Int32Array;
   private readonly bB: Int32Array;
-  readonly bRest: Float32Array;
+  /** 1 where the sheet has been creased: a weak hinge instead of stiff paper. */
   readonly bPlastic: Uint8Array;
   /** -1, or which fold line (0 = horizontal "A", 1 = vertical "B") the triplet's middle sits on. */
   readonly bCrease: Int8Array;
@@ -112,11 +128,13 @@ export class PaperSim {
   private readonly builtAt: Float32Array;
   private pairI = new Int32Array(2048);
   private pairJ = new Int32Array(2048);
-  /** 1 = j stays on the front (+normal) side of i, 2 = on the back side. */
+  /** 0 = undecided, 1 = j stays above i, 2 = i stays above j. */
   private pairUp = new Uint8Array(2048);
   private backI = new Int32Array(2048);
   private backJ = new Int32Array(2048);
   private backUp = new Uint8Array(2048);
+  /** Substeps a pair has spent on the "wrong" side despite being pushed. */
+  private pairStrain = new Uint16Array(2048);
   private pairCount = 0;
   /** Remembered order per (i * n + j), so a pair keeps its order across rebuilds. */
   private readonly pairOrder: Uint8Array;
@@ -223,7 +241,6 @@ export class PaperSim {
     this.bM = new Int32Array(bm);
     this.bB = new Int32Array(bb);
     this.bCrease = new Int8Array(bc);
-    this.bRest = new Float32Array(ba.length);
     this.bPlastic = new Uint8Array(ba.length);
 
     this.cellEntries = new Int32Array(n);
@@ -247,7 +264,6 @@ export class PaperSim {
     }
     this.prev.set(this.pos);
     this.vel.fill(0);
-    this.bRest.fill(0);
     this.bPlastic.fill(0);
     this.grabs = [];
     this.invMass.fill(1);
@@ -263,7 +279,7 @@ export class PaperSim {
 
   /**
    * Take over a pose (e.g. from the folding animation). Any triplet that is
-   * noticeably bent in this pose becomes a crease that remembers the bend.
+   * noticeably bent in this pose becomes a crease (a weak hinge).
    */
   adoptPose(positions: Float32Array, markCreases: boolean): void {
     this.pos.set(positions);
@@ -273,11 +289,7 @@ export class PaperSim {
     if (markCreases) {
       const threshold = this.h * 0.35;
       for (let k = 0; k < this.bA.length; k++) {
-        const c = this.tripletCurvature(k);
-        if (c > threshold) {
-          this.bPlastic[k] = 1;
-          this.bRest[k] = c;
-        }
+        if (this.tripletCurvature(k) > threshold) this.bPlastic[k] = 1;
       }
     }
     this.wake();
@@ -312,9 +324,18 @@ export class PaperSim {
     this.calm = 0;
   }
 
-  grab(particle: number): Grab {
+  /** Hold a particle. With `tether`, the rest of the sheet can't stretch away from it. */
+  grab(particle: number, tether = false): Grab {
     const p = this.pos;
+    let reach: Float32Array | null = null;
+    if (tether) {
+      reach = new Float32Array(this.n);
+      const rx = this.restX[particle];
+      const rz = this.restZ[particle];
+      for (let i = 0; i < this.n; i++) reach[i] = Math.hypot(this.restX[i] - rx, this.restZ[i] - rz);
+    }
     const g: Grab = {
+      reach,
       particle,
       fx: p[particle * 3],
       fy: p[particle * 3 + 1],
@@ -326,6 +347,7 @@ export class PaperSim {
     };
     this.invMass[particle] = 0;
     this.grabs.push(g);
+    this.untouched = 0;
     this.wake();
     return g;
   }
@@ -385,6 +407,7 @@ export class PaperSim {
     this.vel[o] += vx;
     this.vel[o + 1] += vy;
     this.vel[o + 2] += vz;
+    this.untouched = 0;
     this.wake();
   }
 
@@ -401,6 +424,7 @@ export class PaperSim {
       g.fy = this.pos[o + 1];
       g.fz = this.pos[o + 2];
     }
+    this.untouched = this.grabs.length ? 0 : this.untouched + frameDt;
     for (let s = 0; s < subs; s++) this.substep(dt, (s + 1) / subs);
 
     // Sleep once nothing has moved for a while.
@@ -410,9 +434,10 @@ export class PaperSim {
       const s2 = v[i] * v[i] + v[i + 1] * v[i + 1] + v[i + 2] * v[i + 2];
       if (s2 > maxV2) maxV2 = s2;
     }
-    if (this.grabs.length === 0 && maxV2 < 0.0004) {
+    if (this.grabs.length === 0 && (maxV2 < 0.0004 || this.untouched > 4)) {
+      // Asleep once still, and in any case a few seconds after the last touch.
       this.calm += frameDt;
-      if (this.calm > 0.4) {
+      if (this.calm > 0.4 || this.untouched > 4) {
         this.awake = false;
         v.fill(0);
       }
@@ -427,7 +452,10 @@ export class PaperSim {
     const T = this.tuning;
     const gdt = T.gravity * dt;
     const normalDamp = 1 - Math.exp(-T.airNormal * dt);
-    const allDamp = Math.exp(-T.airAll * dt);
+    // Once nobody's touching it, the air slowly thickens so the sheet always
+    // comes to rest instead of trembling on.
+    const settle = 1 + Math.min(30, Math.max(0, this.untouched - T.settleAfter) * 10);
+    const allDamp = Math.exp(-T.airAll * settle * dt);
     const maxSp2 = T.maxSpeed * T.maxSpeed;
 
     for (let i = 0; i < n; i++) {
@@ -465,13 +493,65 @@ export class PaperSim {
       pos[o + 2] = g.fz + (g.tz - g.fz) * frac;
     }
 
-    this.solveDistances(dt);
+    this.solveTethers();
+    for (let k = 0; k < this.tuning.stretchPasses; k++) this.solveDistances(dt);
     this.solveBending(dt);
     this.solveContacts();
     this.solveBounds();
 
     const inv = 1 / dt;
     for (let k = 0; k < pos.length; k++) vel[k] = (pos[k] - prev[k]) * inv;
+    this.dampInternal();
+  }
+
+  /** Paper is a "dead" material: neighbours stop moving relative to each other quickly. */
+  private dampInternal(): void {
+    const { vel, invMass, dA, dB } = this;
+    const k = this.tuning.internalDamping;
+    if (k <= 0) return;
+    for (let e = 0; e < dA.length; e++) {
+      const a = dA[e];
+      const b = dB[e];
+      const wa = invMass[a];
+      const wb = invMass[b];
+      const w = wa + wb;
+      if (w === 0) continue;
+      const oa = a * 3;
+      const ob = b * 3;
+      const fa = (k * wa) / w;
+      const fb = (k * wb) / w;
+      for (let c = 0; c < 3; c++) {
+        const dv = vel[ob + c] - vel[oa + c];
+        vel[oa + c] += dv * fa;
+        vel[ob + c] -= dv * fb;
+      }
+    }
+  }
+
+  private solveTethers(): void {
+    const { pos, invMass, n } = this;
+    for (const g of this.grabs) {
+      const reach = g.reach;
+      if (!reach) continue;
+      const og = g.particle * 3;
+      const gx = pos[og];
+      const gy = pos[og + 1];
+      const gz = pos[og + 2];
+      for (let i = 0; i < n; i++) {
+        if (invMass[i] === 0) continue;
+        const o = i * 3;
+        const dx = pos[o] - gx;
+        const dy = pos[o + 1] - gy;
+        const dz = pos[o + 2] - gz;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        const r = reach[i];
+        if (d2 <= r * r) continue;
+        const f = r / Math.sqrt(d2);
+        pos[o] = gx + dx * f;
+        pos[o + 1] = gy + dy * f;
+        pos[o + 2] = gz + dz * f;
+      }
+    }
   }
 
   private solveDistances(dt: number): void {
@@ -503,11 +583,10 @@ export class PaperSim {
   }
 
   private solveBending(dt: number): void {
-    const { pos, invMass, bA, bM, bB, bRest, bPlastic } = this;
+    const { pos, invMass, bA, bM, bB, bPlastic } = this;
     const idt2 = 1 / (dt * dt);
     const bendAlpha = this.tuning.bendCompliance * idt2;
     const creaseAlpha = this.tuning.creaseCompliance * idt2;
-    const yieldDist = this.tuning.creaseYield * this.h;
     for (let k = 0; k < bA.length; k++) {
       const a = bA[k];
       const m = bM[k];
@@ -524,18 +603,12 @@ export class PaperSim {
       const sy = pos[oa + 1] + pos[ob + 1] - 2 * pos[om + 1];
       const sz = pos[oa + 2] + pos[ob + 2] - 2 * pos[om + 2];
       const len = Math.sqrt(sx * sx + sy * sy + sz * sz);
-      const plastic = bPlastic[k] === 1;
-      let rest = bRest[k];
-      if (plastic) {
-        // Creases give way when pushed past their memory, then hold the new shape.
-        if (len > rest + yieldDist) rest = len - yieldDist;
-        else if (len < rest - yieldDist) rest = len + yieldDist;
-        bRest[k] = rest;
-      }
       if (len < 1e-9) continue;
-      const C = len - rest;
-      if (C === 0) continue;
-      const dl = -C / (W + (plastic ? creaseAlpha : bendAlpha));
+      // Creases are weak hinges: they bend easily and only gently prefer flat,
+      // so a folded note stays folded under its own weight and can never get
+      // into a fight it can't win (which is what makes simulations tremble).
+      const C = len;
+      const dl = -C / (W + (bPlastic[k] === 1 ? creaseAlpha : bendAlpha));
       const f = dl / len;
       pos[oa] += sx * f * wa;
       pos[oa + 1] += sy * f * wa;
@@ -551,7 +624,7 @@ export class PaperSim {
 
   /** Find pairs close enough to touch soon that aren't neighbours on the sheet. */
   private buildContacts(): void {
-    const { pos, normal, n, cellEntries, cellOf, restX, restZ, pairOrder } = this;
+    const { pos, n, cellEntries, cellOf, restX, restZ, pairOrder } = this;
     const h = this.h;
     const R = h * 1.5;
     const R2 = R * R;
@@ -617,11 +690,8 @@ export class PaperSim {
             const rz = restZ[j] - restZ[i];
             if (rx * rx + rz * rz < minRest2) continue;
             const key = i * n + j;
-            let up = pairOrder[key] & 3;
-            if (up === 0) {
-              const side = dx * normal[oi] + dy * normal[oi + 1] + dz * normal[oi + 2];
-              up = side >= 0 ? 1 : 2;
-            }
+            // 0 = not decided yet: that happens on first contact, see solveContacts.
+            const up = pairOrder[key] & 3;
             pairOrder[key] = up | 4;
             if (count === outI.length) {
               const gi = new Int32Array(count * 2);
@@ -658,6 +728,8 @@ export class PaperSim {
     this.pairJ = outJ;
     this.pairUp = outUp;
     this.pairCount = count;
+    if (this.pairStrain.length < outI.length) this.pairStrain = new Uint16Array(outI.length);
+    this.pairStrain.fill(0, 0, count);
     let top = 0;
     for (let k = 0; k < count; k++) {
       top = Math.max(top, pos[outI[k] * 3 + 1], pos[outJ[k] * 3 + 1]);
@@ -703,7 +775,7 @@ export class PaperSim {
     }
     if (this.contactsDirty) this.buildContacts();
 
-    const { pairI, pairJ, pairUp, pairCount, pairOrder, normal } = this;
+    const { pairI, pairJ, pairUp, pairCount, pairOrder, normal, pairStrain } = this;
     const t = this.thickness;
     const reach2 = (this.h * 0.75) ** 2;
     const flipLimit = -this.h * 0.6;
@@ -713,50 +785,56 @@ export class PaperSim {
       const b = pairJ[k];
       const oa = a * 3;
       const ob = b * 3;
+      // Only where both bits of sheet lie roughly flat does "on top" mean
+      // anything; elsewhere forget the order and stay out of the way.
+      if (Math.abs(normal[oa + 1]) < 0.5 || Math.abs(normal[ob + 1]) < 0.5) {
+        if (pairUp[k]) {
+          pairUp[k] = 0;
+          pairOrder[a * n + b] = 0;
+        }
+        continue;
+      }
       const dx = pos[ob] - pos[oa];
-      const dy = pos[ob + 1] - pos[oa + 1];
       const dz = pos[ob + 2] - pos[oa + 2];
-      // Separation along a's normal, signed so it should stay >= thickness.
-      const sign = pairUp[k] === 1 ? 1 : -1;
-      const nx = normal[oa] * sign;
-      const ny = normal[oa + 1] * sign;
-      const nz = normal[oa + 2] * sign;
-      const gap = dx * nx + dy * ny + dz * nz;
+      if (dx * dx + dz * dz > reach2) continue;
+      let order = pairUp[k];
+      if (order === 0) {
+        order = pos[ob + 1] >= pos[oa + 1] ? 1 : 2;
+        pairUp[k] = order;
+        pairOrder[a * n + b] = order;
+      }
+      const up = order === 1 ? b : a;
+      const lo = order === 1 ? a : b;
+      const ou = up * 3;
+      const ol = lo * 3;
+      const gap = pos[ou + 1] - pos[ol + 1];
       if (gap >= t) continue;
-      const d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 - gap * gap > reach2) continue;
-      if (gap < flipLimit) {
+      // Stuck on the wrong side for a while means the rest of the sheet is
+      // holding them there: accept it rather than fight forever.
+      if (gap < -t) pairStrain[k]++;
+      else pairStrain[k] = 0;
+      if (gap < flipLimit || pairStrain[k] > 48) {
+        pairStrain[k] = 0;
         // They went around an edge rather than through each other.
-        pairUp[k] = sign === 1 ? 2 : 1;
+        pairUp[k] = order === 1 ? 2 : 1;
         pairOrder[a * n + b] = pairUp[k];
         continue;
       }
-      const wa = invMass[a];
-      const wb = invMass[b];
-      const w = wa + wb;
+      const wu = invMass[up];
+      const wl = invMass[lo];
+      const w = wu + wl;
       if (w === 0) continue;
       const corr = (t - gap) / w;
-      pos[oa] -= nx * corr * wa;
-      pos[oa + 1] -= ny * corr * wa;
-      pos[oa + 2] -= nz * corr * wa;
-      pos[ob] += nx * corr * wb;
-      pos[ob + 1] += ny * corr * wb;
-      pos[ob + 2] += nz * corr * wb;
+      pos[ou + 1] += corr * wu;
+      pos[ol + 1] -= corr * wl;
       // Friction: damp sliding between the layers.
-      let rx = pos[ob] - prev[ob] - (pos[oa] - prev[oa]);
-      let ry = pos[ob + 1] - prev[ob + 1] - (pos[oa + 1] - prev[oa + 1]);
-      let rz = pos[ob + 2] - prev[ob + 2] - (pos[oa + 2] - prev[oa + 2]);
-      const rn = rx * nx + ry * ny + rz * nz;
-      rx -= rn * nx;
-      ry -= rn * ny;
-      rz -= rn * nz;
-      const fa = (fric * wa) / w;
-      const fb = (fric * wb) / w;
+      const rx = pos[ob] - prev[ob] - (pos[oa] - prev[oa]);
+      const rz = pos[ob + 2] - prev[ob + 2] - (pos[oa + 2] - prev[oa + 2]);
+      const fa = (fric * invMass[a]) / w;
+      const fb = (fric * invMass[b]) / w;
       pos[oa] += rx * fa;
-      pos[oa + 1] += ry * fa;
       pos[oa + 2] += rz * fa;
       pos[ob] -= rx * fb;
-      pos[ob + 1] -= ry * fb;
       pos[ob + 2] -= rz * fb;
     }
   }
