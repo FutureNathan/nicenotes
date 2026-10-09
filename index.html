@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#f5ddd5" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="color-scheme" content="light" />
+    <title>nice notes ♡</title>
+    <meta
+      name="description"
+      content="Fold up a little note for someone you love. Private by design: the note lives only inside the link."
+    />
+    <meta property="og:site_name" content="nice notes" />
+    <meta property="og:title" content="You've got a little note ♡" />
+    <meta property="og:description" content="Someone folded up a note just for you. Tap to unfold it." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://note.yourswith.love/" />
+    <meta property="og:image" content="https://note.yourswith.love/og.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="A small folded note with a heart on it" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  </head>
+  <body>
+    <canvas id="scene" aria-hidden="true"></canvas>
+
+    <header class="brand">
+      <a class="wordmark" href="/" aria-label="nice notes, write a new note">nice notes <span aria-hidden="true">♡</span></a>
+    </header>
+
+    <main id="compose" class="view" hidden>
+      <h1 class="sr-only">Write a little note</h1>
+      <div class="card-wrap">
+        <div class="paper-card" id="card">
+          <canvas id="cardArt" aria-hidden="true"></canvas>
+          <textarea
+            id="message"
+            maxlength="280"
+            rows="6"
+            spellcheck="true"
+            autocapitalize="sentences"
+            placeholder="dear you,&#10;write something sweet…"
+            aria-label="Your note"
+          ></textarea>
+          <div class="from" id="fromRow">
+            <span aria-hidden="true">—</span>
+            <input id="from" maxlength="24" autocomplete="off" autocapitalize="words" placeholder="your name" aria-label="Signed by" />
+          </div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="row swatches" id="swatches" role="radiogroup" aria-label="Paper colour"></div>
+
+        <label class="field">
+          <span class="field-label">for</span>
+          <input id="to" maxlength="24" autocomplete="off" autocapitalize="words" placeholder="their name, written on the outside" />
+        </label>
+
+        <div class="row chips" id="expiry" role="radiogroup" aria-label="Fades after">
+          <span class="field-label">fades after</span>
+        </div>
+
+        <div class="secret">
+          <button type="button" class="toggle" id="secretToggle" aria-expanded="false" aria-controls="secretFields">
+            <span class="toggle-dot" aria-hidden="true"></span> add a secret word
+          </button>
+          <div id="secretFields" class="secret-fields" hidden>
+            <input id="secret" maxlength="40" autocomplete="off" autocapitalize="off" placeholder="a word only they'd know" aria-label="Secret word" />
+            <input id="hint" maxlength="60" autocomplete="off" placeholder="a little hint (optional)" aria-label="Hint for the secret word" />
+          </div>
+        </div>
+
+        <button type="button" class="primary" id="foldBtn">fold it up</button>
+        <p class="fine">
+          private by design · <button type="button" class="link" data-about>how it works</button>
+        </p>
+      </div>
+    </main>
+
+    <section id="stage" class="view stage" hidden>
+      <p id="stageTitle" class="stage-title"></p>
+      <div class="stage-bottom">
+        <p id="stageHint" class="stage-hint"></p>
+        <div id="stageActions" class="actions"></div>
+        <p id="stageFine" class="fine"></p>
+      </div>
+    </section>
+
+    <section id="lock" class="view centered" hidden>
+      <form class="sheet" id="lockForm">
+        <div class="sheet-emoji" aria-hidden="true">🔒</div>
+        <h1>this note has a secret word</h1>
+        <p id="lockHint" class="muted"></p>
+        <input id="lockInput" autocomplete="off" autocapitalize="off" placeholder="secret word" aria-label="Secret word" />
+        <button type="submit" class="primary">open it</button>
+        <p id="lockError" class="error" role="alert"></p>
+      </form>
+    </section>
+
+    <section id="notice" class="view centered" hidden>
+      <div class="sheet">
+        <div class="sheet-emoji" id="noticeEmoji" aria-hidden="true"></div>
+        <h1 id="noticeTitle"></h1>
+        <p id="noticeText" class="muted"></p>
+        <div id="noticeCard"></div>
+        <a class="primary" href="/" id="noticeAction">write a note</a>
+      </div>
+    </section>
+
+    <dialog id="about" aria-labelledby="aboutTitle">
+      <form method="dialog" class="sheet">
+        <h1 id="aboutTitle">how private is it?</h1>
+        <p>
+          Your note lives <strong>only inside the link</strong>, in the part after the <code>#</code>. Browsers never send
+          that part to any server, so it's never uploaded or stored anywhere. Not by us, and not by our host.
+        </p>
+        <p>No accounts, no tracking, no analytics. Fonts are served from here, so nothing else sees you either.</p>
+        <p>
+          Anyone who has the link can open the note, so send it only to them. Add a <strong>secret word</strong> and the
+          note is encrypted; without the word, the link is just noise.
+        </p>
+        <p>
+          "Fades after" hides the note once that time has passed. Because the note is in the link, that's a gentle
+          promise rather than a guarantee, and nobody can stop a screenshot.
+        </p>
+        <button class="primary" value="close">sounds lovely</button>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <div id="sr" class="sr-only" aria-live="polite"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

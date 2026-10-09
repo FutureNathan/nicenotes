@@ -1,0 +1,26 @@
+{
+  "name": "nicenotes",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Tiny private notes on a sheet of paper you can unfold with your fingers.",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fontsource-variable/nunito": "^5.3.0",
+    "@fontsource/caveat": "^5.3.0"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.3"
+  }
+}
